@@ -4,6 +4,7 @@ from typing import Any, Literal, Mapping, Optional, Sequence, Tuple, Type, Union
 from anndata import AnnData
 
 from moscot import _constants
+from moscot._logging import logger
 from moscot._types import (
     ArrayLike,
     CostKwargs_t,
@@ -12,6 +13,7 @@ from moscot._types import (
     ProblemStage_t,
     QuadInitializer_t,
     ScaleCost_t,
+    SinkhornInitializer_t,
 )
 from moscot.base.problems.compound_problem import B, Callback_t, CompoundProblem, K
 from moscot.base.problems.problem import OTProblem
@@ -72,9 +74,9 @@ class MappingProblem(SpatialMappingMixin[K, OTProblem], CompoundProblem[K, OTPro
 
     def prepare(
         self,
-        sc_attr: Union[str, Mapping[str, Any]],
+        sc_attr: Optional[Union[str, Mapping[str, Any]]],
         batch_key: Optional[str] = None,
-        spatial_key: Union[str, Mapping[str, Any]] = "spatial",
+        spatial_key: Optional[Union[str, Mapping[str, Any]]] = "spatial",
         var_names: Optional[Sequence[str]] = None,
         normalize_spatial: bool = True,
         joint_attr: Optional[Union[str, Mapping[str, Any]]] = None,
@@ -172,20 +174,35 @@ class MappingProblem(SpatialMappingMixin[K, OTProblem], CompoundProblem[K, OTPro
         - :attr:`spatial_key` - key in :attr:`~anndata.AnnData.obsm` where the spatial coordinates are stored.
         - :attr:`batch_key` - key in :attr:`~anndata.AnnData.obs` where batches are stored.
         - :attr:`stage` - set to ``'prepared'``.
-        - :attr:`problem_kind` - set to ``'quadratic'``.
+        - :attr:`problem_kind` - set to ``'quadratic'`` (if both ``spatial_key`` and ``sc_attr`` are passed)
+            or ``'linear'`` (if both ``spatial_key`` and ``sc_attr`` are `None`).
         """
-        x = {"attr": "obsm", "key": spatial_key} if isinstance(spatial_key, str) else spatial_key
-        y = {"attr": "obsm", "key": sc_attr} if isinstance(sc_attr, str) else sc_attr
+        if spatial_key and sc_attr:
+            x = {"attr": "obsm", "key": spatial_key} if isinstance(spatial_key, str) else spatial_key
+            y = {"attr": "obsm", "key": sc_attr} if isinstance(sc_attr, str) else sc_attr
 
-        if normalize_spatial and x_callback is None:
-            x_callback = "spatial-norm"
-            if not len(x_callback_kwargs):
-                x_callback_kwargs = x
-        if isinstance(x_callback, str) and x_callback in "spatial-norm":
+            if normalize_spatial and x_callback is None:
+                x_callback = "spatial-norm"
+                if not len(x_callback_kwargs):
+                    x_callback_kwargs = x
+            if isinstance(x_callback, str) and x_callback in "spatial-norm":
+                x = {}
+            self.spatial_key = spatial_key if isinstance(spatial_key, str) else spatial_key["key"]
+            logger.info("Preparing a :term:`quadratic problem`.")
+        elif spatial_key is None and sc_attr is None:
             x = {}
+            y = {}
+            logger.info("Preparing a :term:`linear problem`.")
+            if var_names and len(var_names) == 0:
+                raise ValueError("Expected `var_names` to be non-empty for a :term:`linear problem`.")
+
+        else:
+            raise ValueError(
+                "You either need to set both attr:`spatial_key` and attr:`sc_attr` (for a :term:`quadratic problem`)",
+                "or none of them (for a term:`linear problem`).",
+            )
 
         self.batch_key = batch_key
-        self.spatial_key = spatial_key if isinstance(spatial_key, str) else spatial_key["key"]
         self.filtered_vars = var_names
 
         if self.filtered_vars is not None:
@@ -222,7 +239,7 @@ class MappingProblem(SpatialMappingMixin[K, OTProblem], CompoundProblem[K, OTPro
 
     def solve(
         self,
-        alpha: float = 0.5,
+        alpha: Optional[float] = 0.5,
         epsilon: float = 1e-2,
         tau_a: float = 1.0,
         tau_b: float = 1.0,
@@ -230,7 +247,7 @@ class MappingProblem(SpatialMappingMixin[K, OTProblem], CompoundProblem[K, OTPro
         scale_cost: ScaleCost_t = "mean",
         batch_size: Optional[int] = None,
         stage: Union[ProblemStage_t, Tuple[ProblemStage_t, ...]] = ("prepared", "solved"),
-        initializer: QuadInitializer_t = None,
+        initializer: Union[QuadInitializer_t, SinkhornInitializer_t] = None,
         initializer_kwargs: Mapping[str, Any] = types.MappingProxyType({}),
         jit: bool = True,
         min_iterations: Optional[int] = None,
@@ -261,8 +278,8 @@ class MappingProblem(SpatialMappingMixin[K, OTProblem], CompoundProblem[K, OTPro
             Parameter in :math:`(0, 1]` that defines how much :term:`unbalanced <unbalanced OT problem>` is the problem
             on the target :term:`marginals`. If :math:`1`, the problem is :term:`balanced <balanced OT problem>`.
         rank
-            Rank of the :term:`low-rank OT` solver :cite:`scetbon:21b`.
-            If :math:`-1`, full-rank solver :cite:`peyre:2016` is used.
+            Rank of the :term:`low-rank OT` solver :cite:`scetbon:21a,scetbon:21b`.
+            If :math:`-1`, full-rank solver :cite:`cuturi:2013,peyre:2016` is used.
         scale_cost
             How to re-scale the cost matrices. If a :class:`float`, the cost matrices
             will be re-scaled as :math:`\frac{\text{cost}}{\text{scale_cost}}`.
@@ -279,13 +296,16 @@ class MappingProblem(SpatialMappingMixin[K, OTProblem], CompoundProblem[K, OTPro
         jit
             Whether to :func:`~jax.jit` the underlying :mod:`ott` solver.
         min_iterations
-            Minimum number of :term:`(fused) GW <Gromov-Wasserstein>` iterations.
+            Minimum number of :term:`(fused) GW <Gromov-Wasserstein>` or :term:`Sinkhorn` iterations,
+            depending on :attr:`alpha`.
         max_iterations
-            Maximum number of :term:`(fused) GW <Gromov-Wasserstein>` iterations.
+            Maximum number of :term:`(fused) GW <Gromov-Wasserstein>` or :term:`Sinkhorn` iterations,
+            depending on :attr:`alpha`.
         threshold
-            Convergence threshold of the :term:`GW <Gromov-Wasserstein>` solver.
+            Convergence threshold of the :term:`GW <Gromov-Wasserstein>` or the :term:`Sinkhorn` algorithm,
+            depending on :attr:`alpha`.
         linear_solver_kwargs
-            Keyword arguments for the inner :term:`linear problem` solver.
+            Keyword arguments for the inner :term:`linear problem` solver. Only used when :attr:`alpha` > 0.
         device
             Transfer the solution to a different device, see :meth:`~moscot.base.output.BaseSolverOutput.to`.
             If :obj:`None`, keep the output on the original device.
@@ -299,24 +319,51 @@ class MappingProblem(SpatialMappingMixin[K, OTProblem], CompoundProblem[K, OTPro
         - :attr:`solutions` - the :term:`OT` solutions for each subproblem.
         - :attr:`stage` - set to ``'solved'``.
         """
-        return super().solve(  # type: ignore[return-value]
-            alpha=alpha,
-            epsilon=epsilon,
-            tau_a=tau_a,
-            tau_b=tau_b,
-            rank=rank,
-            scale_cost=scale_cost,
-            batch_size=batch_size,
-            stage=stage,
-            initializer=initializer,
-            initializer_kwargs=initializer_kwargs,
-            jit=jit,
-            min_iterations=min_iterations,
-            max_iterations=max_iterations,
-            threshold=threshold,
-            linear_solver_kwargs=linear_solver_kwargs,
-            device=device,
+        solve_kwargs = {
+            "epsilon": epsilon,
+            "tau_a": tau_a,
+            "tau_b": tau_b,
+            "rank": rank,
+            "scale_cost": scale_cost,
+            "batch_size": batch_size,
+            "stage": stage,
+            "initializer": initializer,
+            "initializer_kwargs": initializer_kwargs,
+            "jit": jit,
+            "min_iterations": min_iterations,
+            "max_iterations": max_iterations,
+            "threshold": threshold,
+            "device": device,
             **kwargs,
+        }
+
+        # convert problem type to linear for alpha=0
+        if alpha == 0.0 and self.problem_kind != "linear":
+            if self.filtered_vars and len(self.filtered_vars) == 0:
+                raise ValueError("Expected `var_names` to be non-empty for a :attr:`alpha`=0.")
+            logger.info("Ignoring quadratic terms for :attr:`alpha=0`.")
+            self._problem_kind = "linear"
+            for _, value in self.problems.items():
+                value._x = None
+                value._y = None
+                value._problem_kind = "linear"
+
+        # prepare solver kwargs, depending on the problem type
+        if self.problem_kind == "linear":
+            if alpha is not None and alpha > 0:
+                logger.warning("Ignoring :attr:`alpha` for `'linear'` problems.")
+            if "lse_mode" in linear_solver_kwargs:
+                solve_kwargs["lse_mode"] = linear_solver_kwargs["lse_mode"]
+            if "inner_iterations" in linear_solver_kwargs:
+                solve_kwargs["inner_iterations"] = linear_solver_kwargs["inner_iterations"]
+        else:
+            if alpha is None:
+                raise ValueError("Expected :attr:`alpha` to be in interval `[0, 1]`, found `None`.")
+            solve_kwargs["alpha"] = alpha
+            solve_kwargs["linear_solver_kwargs"] = linear_solver_kwargs
+
+        return super().solve(  # type: ignore[return-value]
+            **solve_kwargs,
         )
 
     @property
